@@ -70,34 +70,39 @@ origin: docs/ideation/2026-05-12-ascend-recsys-visualization.md
 
 **功能结构**:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Gradio UI (前端)                         │
-│   用户ID输入 → 推荐结果展示 → 推荐理由展示 → 反馈按钮            │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      FastAPI (API层)                            │
-│   POST /recommend(user_id, k) → {recommendations, source}      │
-│   GET /health → {status: ok}                                    │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Recommender (推荐器)                           │
-│   recommend(user_id, k) → List[Recommendation]                  │
-│       ├── HSTU Model Inference (优先)                           │
-│       └── Fallback Rules (降级)                                  │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    MovieLens Dataset (数据)                     │
-│   get_user_history(user_id) → List[Movie]                       │
-│   get_movie(movie_id) → Movie                                   │
-│   get_top_movies_by_genre(genre, k) → List[Movie]              │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph UI["Gradio UI (前端)"]
+        A[用户ID输入] --> B[推荐结果展示]
+        B --> C[推荐理由展示]
+        C --> D[反馈按钮]
+    end
+
+    subgraph API["FastAPI (API层)"]
+        E["POST /recommend<br/>user_id, k"] --> F{验证参数}
+        F -->|有效| G[/recommend响应/]
+        F -->|无效| H[返回422]
+    end
+
+    subgraph Recommender["Recommender (推荐器)"]
+        I["recommend(user_id, k)"] --> J{HSTU模型可用?}
+        J -->|是| K[HSTU模型推理]
+        J -->|否| L[Fallback降级规则]
+        K --> M[Top-K排序]
+        L --> M
+    end
+
+    subgraph Data["MovieLens Dataset (数据)"]
+        N["get_user_history(user_id)"] --> O[用户历史电影列表]
+        P["get_movie(movie_id)"] --> Q[电影信息]
+        R["get_imdb_id(movie_id)"] --> S["IMDb ID (ttxxx)"]
+    end
+
+    A --> E
+    E --> I
+    I --> O
+    I --> K
+    M --> G
 ```
 
 **核心模块职责**:
@@ -117,18 +122,34 @@ origin: docs/ideation/2026-05-12-ascend-recsys-visualization.md
 
 **并发与同步**:
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                         请求处理流程                               │
-│                                                                   │
-│  用户请求 ──▶ API验证 ──▶ 模型推理 ──▶ 结果包装 ──▶ 返回响应     │
-│                   │           │                                   │
-│                   │           ▼                                   │
-│                   │      [超时检测]                               │
-│                   │           │                                   │
-│                   ▼           ▼                                   │
-│              [参数错误]   [失败] ──▶ 降级规则 ──▶ 返回兜底结果   │
-└──────────────────────────────────────────────────────────────────┘
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant API as FastAPI
+    participant Rec as Recommender
+    participant Model as HSTU模型
+    participant Fallback as 降级规则
+
+    User->>API: POST /recommend<br/>{user_id, k}
+    API->>API: 参数验证
+
+    alt 参数有效
+        API->>Rec: recommend(user_id, k)
+        Rec->>Model: 获取用户历史
+
+        alt 模型可用
+            Model-->>Rec: 用户历史 → 电影评分
+            Rec->>Rec: Top-K排序
+        else 模型不可用/超时
+            Rec->>Fallback: 触发降级
+            Fallback-->>Rec: 热门/类型匹配推荐
+        end
+
+        Rec-->>API: 返回推荐列表
+        API-->>User: {recommendations, source}
+    else 参数无效
+        API-->>User: 422 Invalid Parameters
+    end
 ```
 
 **关键处理点**:
@@ -143,37 +164,36 @@ origin: docs/ideation/2026-05-12-ascend-recsys-visualization.md
 
 **部署架构**:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Docker Container                           │
-│                                                                  │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │  Container (Python 3.10 + CANN 8.0)                      │   │
-│  │                                                          │   │
-│  │  ┌─────────────────┐    ┌─────────────────────────┐    │   │
-│  │  │  Gradio UI     │    │  FastAPI + Uvicorn      │    │   │
-│  │  │  Port: 7860    │    │  Port: 8000             │    │   │
-│  │  └─────────────────┘    └─────────────────────────┘    │   │
-│  │           │                      │                      │   │
-│  │           └──────────────────────┼──────────────────────│   │
-│  │                                  │                      │   │
-│  │                    ┌─────────────▼─────────────┐       │   │
-│  │                    │   Recommender Service    │       │   │
-│  │                    │   (推理 + 降级逻辑)      │       │   │
-│  │                    └─────────────┬─────────────┘       │   │
-│  │                                  │                      │   │
-│  │                    ┌─────────────▼─────────────┐       │   │
-│  │                    │   HSTU Model (PyTorch)  │       │   │
-│  │                    │   + Ascend NPU Backend  │       │   │
-│  │                    └───────────────────────────┘       │   │
-│  │                                                          │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│                            │                                     │
-│                    ┌───────▼───────┐                            │
-│                    │  Ascend NPU  │                            │
-│                    │  /dev/davinci0│                            │
-│                    └───────────────┘                            │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph Docker["Docker Container"]
+        subgraph Container["Container (Python 3.10 + CANN 8.0)"]
+            subgraph Services["服务层"]
+                UI["Gradio UI<br/>:7860"]
+                API["FastAPI + Uvicorn<br/>:8000"]
+            end
+
+            subgraph Logic["推理层"]
+                Rec["Recommender Service<br/>(推理 + 降级逻辑)"]
+                Model["HSTU Model<br/>(PyTorch + NPU)"]
+            end
+
+            UI <-->|HTTP| API
+            API <--> Rec
+            Rec <--> Model
+        end
+
+        NPU["Ascend NPU<br/>/dev/davinci0"]
+        Model -->|调用| NPU
+    end
+
+    subgraph External["外部依赖"]
+        OMDB["OMDB API<br/>(海报)"]
+        Cache["Poster Cache<br/>(本地缓存)"]
+    end
+
+    Rec -.->|获取海报| Cache
+    Cache -.->|无缓存时| OMDB
 ```
 
 **环境变量**:
@@ -187,31 +207,44 @@ origin: docs/ideation/2026-05-12-ascend-recsys-visualization.md
 
 **代码组织**:
 
-```
-rec_interactive_demo/
-├── src/                          # 源代码
-│   ├── data/                      # 数据处理层
-│   │   ├── download.py            # 数据下载
-│   │   ├── preprocess.py           # 数据预处理
-│   │   └── movielens.py           # Dataset类
-│   ├── model/                     # 模型层
-│   │   └── hstu.py                # HSTU序列模型
-│   ├── inference/                 # 推理层
-│   │   ├── recommender.py         # 推荐器
-│   │   ├── fallback.py            # 降级规则
-│   │   └── api.py                 # FastAPI
-│   └── ui/                        # 前端层
-│       └── gradio_app.py          # Gradio
-├── data/                          # 数据目录
-│   ├── raw/ml-1m/                # 原始数据
-│   └── models/model.pt            # 模型文件
-├── tests/                         # 测试
-│   └── test_integration.py        # 集成测试
-├── docker/                        # 部署配置
-│   ├── Dockerfile
-│   ├── docker-compose.yml
-│   └── entrypoint.sh
-└── requirements.txt
+```mermaid
+graph TD
+    Root["rec_interactive_demo/"]
+
+    Root --> Src["src/"]
+    Root --> Data["data/"]
+    Root --> Tests["tests/"]
+    Root --> Docker["docker/"]
+    Root --> Req["requirements.txt"]
+
+    Src --> DataLayer["data/"]
+    Src --> ModelLayer["model/"]
+    Src --> InferenceLayer["inference/"]
+    Src --> UILayer["ui/"]
+
+    DataLayer --> download["download.py"]
+    DataLayer --> preprocess["preprocess.py"]
+    DataLayer --> movielens["movielens.py"]
+
+    ModelLayer --> hstu["hstu.py"]
+
+    InferenceLayer --> recommender["recommender.py"]
+    InferenceLayer --> fallback["fallback.py"]
+    InferenceLayer --> api["api.py"]
+
+    UILayer --> gradio_app["gradio_app.py"]
+    UILayer --> components["components.py"]
+
+    Data --> Raw["raw/ml-1m/"]
+    Data --> Processed["processed/"]
+    Processed --> Posters["posters/"]
+    Processed --> Movies["movies.parquet"]
+    Data --> Models["models/"]
+
+    Tests --> integration["test_integration.py"]
+    Docker --> Dockerfile
+    Docker --> compose["docker-compose.yml"]
+    Docker --> entry["entrypoint.sh"]
 ```
 
 **依赖关系**:
@@ -245,20 +278,18 @@ requirements.txt
 | S5 | Gradio交互 | 输入user_id=1, k=5 → 展示结果 | 5秒内显示推荐 |
 
 **用户交互流**:
-```
-1. 用户访问 http://localhost:7860
-2. 输入用户ID: 1
-3. 选择推荐数量: 10
-4. 点击"获取推荐"
-5. 显示界面:
-   ┌─────────────────────────────────────────────────────────────────┐
-   │  你的观影历史                        为你推荐                      │
-   │  ┌────┐ ┌────┐ ┌────┐ ┌────┐      ┌────┐ ┌────┐ ┌────┐     │
-   │  │海报│ │海报│ │海报│ │海报│      │海报│ │海报│ │海报│     │
-   │  └────┘ └────┘ └────┘ └────┘      └────┘ └────┘ └────┘     │
-   │  Matrix ★5  Terminator ★4        推荐理由: 你喜欢科幻类电影     │
-   └─────────────────────────────────────────────────────────────────┘
-6. (可选) 点击喜欢/不喜欢反馈
+
+```mermaid
+flowchart LR
+    A["访问 http://localhost:7860"] --> B["输入用户ID: 1"]
+    B --> C["选择推荐数量: 10"]
+    C --> D["点击「获取推荐」"]
+    D --> E["显示推荐界面"]
+    E --> F["用户历史海报网格<br/>左侧: 观影历史"]
+    E --> G["推荐结果海报网格<br/>右侧: 为你推荐"]
+    F --> H["推荐理由标签"]
+    G --> H
+    H --> I["点击喜欢/不喜欢<br/>(可选反馈)"]
 ```
 
 ---
