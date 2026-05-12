@@ -40,6 +40,7 @@ origin: docs/ideation/2026-05-12-ascend-recsys-visualization.md
 - R4. 提供Docker一键部署能力
 - R5. 当模型推理不可用时，自动降级到基于规则的推荐（结合用户历史）
 - R6. 整个流程在2周内可完成端到端实现
+- R7. 前端展示电影海报和用户观影历史
 
 **Origin actors:** 数据科学家（演示观众）、开发工程师（系统维护者）
 **Origin flows:** 数据加载 → 模型训练 → 推理服务 → API调用 → 前端展示
@@ -100,12 +101,15 @@ origin: docs/ideation/2026-05-12-ascend-recsys-visualization.md
 ```
 
 **核心模块职责**:
-- **Gradio UI**: 用户交互界面，接收user_id，展示推荐结果
+- **Gradio UI**: 用户交互界面，接收user_id，展示推荐结果、海报和用户历史
+- **Gradio Components**: 可视化组件封装（海报网格、推荐卡片）
 - **FastAPI**: RESTful API服务，请求路由和数据验证
 - **Recommender**: 核心推荐逻辑，协调模型推理和降级
 - **HSTU Model**: 序列推荐模型，输入用户历史，输出电影评分
 - **Fallback Rules**: 规则降级，基于用户历史类型匹配热门电影
-- **MovieLens Dataset**: 数据访问接口，提供用户历史和电影信息
+- **MovieLens Dataset**: 数据访问接口，提供用户历史、电影信息和IMDb ID映射
+- **Poster Cache**: 海报缓存管理，从OMDB API获取并缓存海报
+  - 映射流程: movie_id → imdb_id → `tt{imdb_id}` → OMDB API
 
 ---
 
@@ -246,12 +250,14 @@ requirements.txt
 2. 输入用户ID: 1
 3. 选择推荐数量: 10
 4. 点击"获取推荐"
-5. 显示推荐结果卡片:
-   ┌─────────────────────────────────┐
-   │ 电影: The Matrix (1999)        │
-   │ 评分: 0.95                     │
-   │ 理由: 因为你看过科幻类电影       │
-   └─────────────────────────────────┘
+5. 显示界面:
+   ┌─────────────────────────────────────────────────────────────────┐
+   │  你的观影历史                        为你推荐                      │
+   │  ┌────┐ ┌────┐ ┌────┐ ┌────┐      ┌────┐ ┌────┐ ┌────┐     │
+   │  │海报│ │海报│ │海报│ │海报│      │海报│ │海报│ │海报│     │
+   │  └────┘ └────┘ └────┘ └────┘      └────┘ └────┘ └────┘     │
+   │  Matrix ★5  Terminator ★4        推荐理由: 你喜欢科幻类电影     │
+   └─────────────────────────────────────────────────────────────────┘
 6. (可选) 点击喜欢/不喜欢反馈
 ```
 
@@ -283,7 +289,7 @@ requirements.txt
 - **训练方式**: 单节点训练，使用Ascend CANN + torch-npu，不使用分布式
 - **推理引擎**: 原生PyTorch + Ascend NPU后端（torch.npu）
 - **API服务**: FastAPI（轻量、Python原生、自动文档）
-- **前端**: Gradio（推荐系统专用组件、快速原型）
+- **前端**: Gradio（推荐系统专用组件、快速原型，含电影海报和用户历史可视化）
 - **部署**: Docker + docker-compose（开箱即用）
 - **降级策略**: 基于用户历史的分层降级
   - 有历史用户 → 基于类型匹配的热门推荐
@@ -305,6 +311,7 @@ requirements.txt
 - 模型训练的超参数（需根据硬件调整）
 - 推荐结果数量K的默认值（需根据UI测试确定）
 - 嵌入维度（需权衡模型大小和推理速度）
+- OMDB API key配置（需申请免费的API key: https://www.omdbapi.com/apikey.aspx）
 
 ---
 
@@ -316,7 +323,8 @@ rec_interactive_demo/
 │   ├── raw/                   # 原始数据
 │   │   └── ml-1m/
 │   ├── processed/              # 处理后数据
-│   │   └── movies.parquet    # 电影元数据
+│   │   ├── movies.parquet    # 电影元数据
+│   │   └── posters/          # 电影海报缓存
 │   └── models/                # 保存的模型
 │       └── model.pt
 ├── src/                       # 源代码
@@ -339,7 +347,8 @@ rec_interactive_demo/
 │   │   └── api.py              # FastAPI服务
 │   ├── ui/                    # 前端UI (U4)
 │   │   ├── __init__.py
-│   │   └── gradio_app.py      # Gradio应用
+│   │   ├── gradio_app.py     # Gradio应用
+│   │   └── components.py     # 可视化组件
 ├── docker/                    # Docker配置 (U5)
 │   ├── Dockerfile
 │   ├── docker-compose.yml
@@ -420,9 +429,13 @@ rec_interactive_demo/
 
 **Approach:**
 - 使用标准Python项目结构
-- requirements.txt: torch, fastapi, gradio, uvicorn, pandas, numpy, scikit-learn, pyarrow
+- requirements.txt: torch, fastapi, gradio, uvicorn, pandas, numpy, scikit-learn, pyarrow, requests
 - 数据处理: 下载MovieLens 1M → 解析 → 转换为模型可用格式
-- MovieLens Dataset类: 提供`get_user_history(user_id)`和`get_movie(movie_id)`接口
+- **ID映射**: MovieLens movieId → links.csv → imdbId → `tt{imdbId}` → OMDB API
+- MovieLens Dataset类:
+  - `get_user_history(user_id)`: 返回用户历史电影列表
+  - `get_movie(movie_id)`: 返回电影信息(含imdb_id)
+  - `get_imdb_id(movie_id)`: 返回格式化的IMDb ID (`tt{imdbId}`)
 
 **Patterns to follow:**
 - torch.utils.data.Dataset接口
@@ -432,9 +445,11 @@ rec_interactive_demo/
 - Happy path: 成功下载并解析MovieLens数据，`get_user_history`返回正确历史
 - Edge case: 用户无历史时返回空列表
 - Edge case: 电影ID不存在时返回None
+- Edge case: links.csv缺少imdbId时的处理
 
 **Verification:**
 - `python -c "from src.data.movielens import MovieLensDataset; ds = MovieLensDataset('./data'); print(ds.get_user_history(1))"` 返回用户1的历史
+- `python -c "from src.data.movielens import MovieLensDataset; ds = MovieLensDataset('./data'); print(ds.get_imdb_id(1))"` 返回 `tt0114709`
 
 ---
 
@@ -515,7 +530,10 @@ with torch.no_grad():
   - `GET /health`: 健康检查
   - `POST /recommend`: 推荐接口
     - 输入: `{"user_id": int, "k": int}`
-    - 输出: `{"recommendations": [{"movie_id": int, "score": float, "title": str, "reason": str}], "source": "model|fallback"}`
+    - 输出: `{"recommendations": [{"movie_id": int, "score": float, "title": str, "poster_url": str, "reason": str}], "source": "model|fallback", "user_history": [{"movie_id": int, "title": str, "poster_url": str, "rating": float}]}`
+  - `GET /poster/{movie_id}`: 海报获取
+    - 流程: movie_id → 获取imdb_id → 转换为tt格式 → 查询本地缓存 → 无则调用OMDB API → 缓存返回
+  - 海报URL生成: `POST /recommend`返回的poster_url为 `/poster/{movie_id}`，前端通过此路径获取实际图片
 
 **Patterns to follow:**
 - FastAPI最佳实践 + Pydantic数据验证
@@ -538,9 +556,9 @@ curl -X POST http://localhost:8000/recommend \
 
 ---
 
-- U4. **Gradio前端界面**
+- U4. **Gradio前端界面（含可视化）**
 
-**Goal:** 实现交互式Web界面，展示推荐效果
+**Goal:** 实现交互式Web界面，展示带电影海报和用户历史的推荐效果
 
 **Requirements:** R1, R2
 
@@ -549,29 +567,49 @@ curl -X POST http://localhost:8000/recommend \
 **Files:**
 - Create: `src/ui/__init__.py`
 - Create: `src/ui/gradio_app.py`
+- Create: `src/ui/components.py` — 可视化组件封装
+- Create: `data/processed/posters/` — 电影海报缓存目录
 
 **Approach:**
-- Gradio Blocks API自定义布局
-- 组件:
+- **电影海报获取**:
+  - 使用OMDB API获取电影海报（免费API，需API key）
+  - 海报缓存到本地 `data/processed/posters/{movie_id}.jpg`
+  - 降级策略: 如果API无海报，返回默认占位图
+- **用户历史展示**:
+  - 在推荐结果左侧展示用户看过的电影（海报网格）
+  - 每行4-5张海报，显示用户偏好
+- **Gradio布局**:
+  ```
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  用户ID: [___]  推荐数量: [===]  [获取推荐]                      │
+  ├─────────────────────────────────────────────────────────────────┤
+  │  你的观影历史:                    为你推荐:                      │
+  │  ┌────┐ ┌────┐ ┌────┐ ┌────┐   ┌────┐ ┌────┐ ┌────┐ ┌────┐  │
+  │  │海报│ │海报│ │海报│ │海报│   │海报│ │海报│ │海报│ │海报│  │
+  │  └────┘ └────┘ └────┘ └────┘   └────┘ └────┘ └────┘ └────┘  │
+  │  《电影1》评分5 《电影2》评分4   推荐理由: 因为你喜欢科幻类      │
+  └─────────────────────────────────────────────────────────────────┘
+  ```
+- **组件**:
   - 用户ID输入框 (Number)
   - 推荐数量滑块 (Slider)
-  - 推荐结果展示 (DataFrame或自定义卡片)
-  - 推荐理由展示
+  - 用户历史海报网格 (Gallery)
+  - 推荐结果海报网格 (Gallery) + 推荐理由文本
   - 反馈按钮 (喜欢/不喜欢 — 仅展示用)
-- 调用API: `http://localhost:8000/recommend`
 
 **Patterns to follow:**
-- Gradio Blocks API
-- 重用API服务客户端
+- Gradio Blocks API + Gallery组件
+- OMDB API集成（带缓存）
 
 **Test scenarios:**
-- Happy path: Gradio界面正常启动，可获取推荐
+- Happy path: 海报正常显示，用户历史正常加载
+- Edge case: 海报加载失败时显示默认占位图
+- Edge case: 用户无历史时显示"暂无观影记录"
 - Edge case: API连接失败时显示错误提示
-- Edge case: 推荐结果为空时的展示
 
 **Verification:**
 - Gradio应用在 http://localhost:7860 正常访问
-- 输入user_id=1, k=5后显示5条推荐及理由
+- 输入user_id=1, k=5后显示用户历史海报 + 5条推荐海报及理由
 
 ---
 
